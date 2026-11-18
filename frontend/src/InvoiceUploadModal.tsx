@@ -3,7 +3,7 @@ import {
   formatFileSize,
   compressImageIfNeeded,
   readFileAsDataUrl,
-  saveInvoiceToIdb,
+  saveInvoiceAttachment,
   type InvoiceAttachment,
 } from "./invoiceStorage";
 import { apiPost } from "./api";
@@ -92,17 +92,16 @@ export function InvoiceUploadModal({ order, onClose, onSuccess }: InvoiceUploadM
         uploaded_at: new Date().toISOString(),
       };
 
-      // 1. Save directly into browser IndexedDB for unlimited capacity
-      await saveInvoiceToIdb(order.id, attachment);
+      // 1. Save directly into browser IndexedDB & Cloud RTDB
+      await saveInvoiceAttachment(order.id, attachment);
 
       // 2. Call API to update the order record and sync with RTDB
-      // For RTDB and localStorage, keep attachment in order
       const res = await apiPost(`/orders/${order.id}/invoice`, {
         invoice_file: attachment,
       });
 
       show("Invoice uploaded and attached successfully", "success");
-      onSuccess(res || { ...order, invoice_file: attachment });
+      onSuccess(res || { ...order, invoice_file: { name: attachment.name, type: attachment.type, size: attachment.size, uploaded_at: attachment.uploaded_at, has_attachment: true } });
       onClose();
     } catch (err: any) {
       console.error("Upload error:", err);

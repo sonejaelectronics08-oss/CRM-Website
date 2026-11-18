@@ -21,6 +21,9 @@ import {
   SEED_ORDERS,
   SEED_EXPENSES,
   recalculateAllInventory,
+  getStored,
+  setStored,
+  cleanInvoiceMeta,
 } from "./mockData";
 
 let rtdbInstance: Database | null = null;
@@ -143,21 +146,12 @@ export function startRealtimeSync(queryClient: QueryClient) {
   const rtdb = getRtdbInstance();
   if (!rtdb) return;
 
-  const STORAGE_PREFIX = "soneja_demo_";
-
   function getLocalStore<T>(key: string, defaultVal: T): T {
-    try {
-      const raw = localStorage.getItem(STORAGE_PREFIX + key);
-      return raw ? JSON.parse(raw) : defaultVal;
-    } catch {
-      return defaultVal;
-    }
+    return getStored<T>(key, defaultVal);
   }
 
   function updateLocalStore(key: string, data: any[]) {
-    try {
-      localStorage.setItem(STORAGE_PREFIX + key, JSON.stringify(data));
-    } catch {}
+    setStored(key, data);
   }
 
   // 0. Deleted Items Listeners (Tombstones from Cloud)
@@ -199,9 +193,18 @@ export function startRealtimeSync(queryClient: QueryClient) {
       const allOrders = val ? Object.values(val) : [];
       const deletedIds = getLocalDeletedIds("orders");
 
-      // Strictly filter out any deleted orders so they never show or re-save
+      // Strictly filter out any deleted orders, and ensure clean metadata for attachments
       const orders = (allOrders as any[])
-        .filter((o) => o && o.id && !deletedIds.has(o.id) && !o.deleted_at);
+        .filter((o) => o && o.id && !deletedIds.has(o.id) && !o.deleted_at)
+        .map((o) => {
+          if (o.invoice_file && o.invoice_file.data_url) {
+            return {
+              ...o,
+              invoice_file: cleanInvoiceMeta(o.invoice_file),
+            };
+          }
+          return o;
+        });
       orders.sort((a: any, b: any) => new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime());
 
       // If any order in RTDB is found in deletedIds, actively purge it from RTDB
@@ -379,7 +382,12 @@ export async function syncOrderToFirestore(order: any) {
   const rtdb = getRtdbInstance();
   if (!rtdb || !order || !order.id) return;
   try {
-    await set(ref(rtdb, `orders/${order.id}`), sanitizeForFirebase(order));
+    const sanitized = sanitizeForFirebase(order);
+    if (sanitized.invoice_file && sanitized.invoice_file.data_url) {
+      await set(ref(rtdb, `invoices/${order.id}`), sanitized.invoice_file);
+      sanitized.invoice_file = cleanInvoiceMeta(sanitized.invoice_file);
+    }
+    await set(ref(rtdb, `orders/${order.id}`), sanitized);
   } catch (e) {
     console.error("RTDB syncOrder failed:", e);
   }
@@ -392,6 +400,7 @@ export async function deleteOrderFromFirestore(orderId: string) {
   try {
     await set(ref(rtdb, `deleted_orders/${orderId}`), Date.now());
     await remove(ref(rtdb, `orders/${orderId}`));
+    await remove(ref(rtdb, `invoices/${orderId}`));
   } catch (e) {
     console.error("RTDB deleteOrder failed:", e);
   }

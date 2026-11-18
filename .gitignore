@@ -92,3 +92,5 @@ credentials.json
 # Local containers & tools
 mongo_data/
 .emergent/
+.playwright-mcp/
+*.pdf

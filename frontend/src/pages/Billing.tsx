@@ -17,7 +17,7 @@ import {
   formatFileSize,
   readFileAsDataUrl,
   compressImageIfNeeded,
-  saveInvoiceToIdb,
+  saveInvoiceAttachment,
   type InvoiceAttachment,
 } from "../invoiceStorage";
 
@@ -253,7 +253,7 @@ export default function Billing() {
 
       const res = await apiPost("/sales", orderBody);
       if (attachedAttachment && res?.id) {
-        await saveInvoiceToIdb(res.id, attachedAttachment);
+        await saveInvoiceAttachment(res.id, attachedAttachment);
       }
 
       const billData: BillData = {

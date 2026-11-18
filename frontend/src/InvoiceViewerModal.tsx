@@ -1,5 +1,10 @@
 import React, { useState, useEffect } from "react";
-import { formatFileSize, getInvoiceFromIdb, deleteInvoiceFromIdb, type InvoiceAttachment } from "./invoiceStorage";
+import {
+  formatFileSize,
+  getInvoiceAttachment,
+  deleteInvoiceAttachment,
+  type InvoiceAttachment,
+} from "./invoiceStorage";
 import { apiDelete } from "./api";
 import { formatDateTime } from "./format";
 import { useToast } from "./toast";
@@ -36,7 +41,7 @@ export function InvoiceViewerModal({
         return;
       }
       try {
-        const idbInvoice = await getInvoiceFromIdb(order.id);
+        const idbInvoice = await getInvoiceAttachment(order.id);
         if (mounted) {
           if (idbInvoice) {
             setInvoice(idbInvoice);
@@ -103,7 +108,7 @@ export function InvoiceViewerModal({
   async function handleDelete() {
     setIsDeleting(true);
     try {
-      await deleteInvoiceFromIdb(order.id);
+      await deleteInvoiceAttachment(order.id);
       const res = await apiDelete(`/orders/${order.id}/invoice`);
       show("Invoice attachment deleted", "info");
       if (onInvoiceUpdated) onInvoiceUpdated(res || { ...order, invoice_file: null });

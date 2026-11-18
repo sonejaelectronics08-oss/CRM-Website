@@ -9,7 +9,7 @@ import {
   formatFileSize,
   readFileAsDataUrl,
   compressImageIfNeeded,
-  saveInvoiceToIdb,
+  saveInvoiceAttachment,
   type InvoiceAttachment,
 } from "../invoiceStorage";
 
@@ -140,7 +140,7 @@ export default function OrderForm({ kind }: { kind: Kind }) {
       };
       const res = await (isEdit ? apiPut(`/orders/${editId}`, body) : apiPost(isSale ? "/sales" : "/purchases", body));
       if (attachedAttachment && (res?.id || editId)) {
-        await saveInvoiceToIdb(res?.id || editId, attachedAttachment);
+        await saveInvoiceAttachment(res?.id || editId, attachedAttachment);
       }
       return res;
     },

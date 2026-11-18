@@ -12,6 +12,12 @@ import {
   recordLocalDeletedId,
 } from "./firebaseSync";
 import { combineDateWithCurrentTime } from "./format";
+import {
+  saveToIndexedDB,
+  getFromIndexedDB,
+  saveInvoiceAttachment,
+  deleteInvoiceAttachment,
+} from "./invoiceStorage";
 
 export const SEED_PRODUCTS = [
   { id: "p1", model: "32 Worldtech SM", sku: "32-WORLDTECH-SM", category: "Television", cost_price: 9200, sell_price: 10100, qty_on_hand: 12 },
@@ -93,34 +99,94 @@ export const SEED_ORDERS = [
 
 const STORAGE_PREFIX = "soneja_demo_";
 
-function getStored<T>(key: string, defaultVal: T): T {
-  try {
-    const raw = localStorage.getItem(STORAGE_PREFIX + key);
-    if (!raw) {
-      localStorage.setItem(STORAGE_PREFIX + key, JSON.stringify(defaultVal));
-      return defaultVal;
-    }
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed) && ["orders", "products", "dealers", "expenses"].includes(key)) {
-      const deletedIds = getLocalDeletedIds(key);
-      return parsed.filter((item: any) => item && item.id && !deletedIds.has(item.id) && !item.deleted_at) as T;
-    }
-    return parsed;
-  } catch {
-    return defaultVal;
-  }
+// Fast in-memory cache to guarantee 0ms synchronous access for mock API handlers
+// while IndexedDB provides virtually unlimited capacity (>1GB), bypassing the 5MB browser limit
+export const memoryStore: Record<string, any> = {};
+
+// Helper to strip heavy data_url from invoice_file metadata to keep memory & order objects lightweight
+export function cleanInvoiceMeta(invoice: any): any {
+  if (!invoice) return null;
+  return {
+    name: invoice.name || "invoice.pdf",
+    type: invoice.type || "application/pdf",
+    size: Number(invoice.size) || 0,
+    uploaded_at: invoice.uploaded_at || new Date().toISOString(),
+    has_attachment: true,
+  };
 }
 
-function setStored<T>(key: string, val: T) {
-  try {
-    if (Array.isArray(val) && ["orders", "products", "dealers", "expenses"].includes(key)) {
+// Hydrate memory cache from IndexedDB on startup
+if (typeof window !== "undefined") {
+  ["orders", "products", "dealers", "expenses"].forEach(async (key) => {
+    try {
+      const fromIdb = await getFromIndexedDB<any[]>(key);
+      if (fromIdb && Array.isArray(fromIdb) && fromIdb.length > 0) {
+        if (!memoryStore[key] || memoryStore[key].length < fromIdb.length) {
+          memoryStore[key] = fromIdb;
+        }
+      }
+    } catch {}
+  });
+}
+
+export function getStored<T>(key: string, defaultVal: T): T {
+  // 1. Return from in-memory store if populated
+  if (memoryStore[key] !== undefined && memoryStore[key] !== null) {
+    const memVal = memoryStore[key];
+    if (Array.isArray(memVal) && ["orders", "products", "dealers", "expenses"].includes(key)) {
       const deletedIds = getLocalDeletedIds(key);
-      const filtered = val.filter((item: any) => item && item.id && !deletedIds.has(item.id) && !item.deleted_at);
-      localStorage.setItem(STORAGE_PREFIX + key, JSON.stringify(filtered));
-      return;
+      return memVal.filter((item: any) => item && item.id && !deletedIds.has(item.id) && !item.deleted_at) as T;
     }
-    localStorage.setItem(STORAGE_PREFIX + key, JSON.stringify(val));
+    return memVal as T;
+  }
+
+  // 2. Check localStorage for synchronous startup fallback
+  try {
+    const raw = localStorage.getItem(STORAGE_PREFIX + key);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && ["orders", "products", "dealers", "expenses"].includes(key)) {
+        const deletedIds = getLocalDeletedIds(key);
+        const filtered = parsed.filter((item: any) => item && item.id && !deletedIds.has(item.id) && !item.deleted_at);
+        memoryStore[key] = filtered;
+        return filtered as T;
+      }
+      memoryStore[key] = parsed;
+      return parsed as T;
+    }
   } catch {}
+
+  // 3. Fall back to default
+  memoryStore[key] = defaultVal;
+  return defaultVal;
+}
+
+export function setStored<T>(key: string, val: T) {
+  let toStore: any = val;
+  if (Array.isArray(val) && ["orders", "products", "dealers", "expenses"].includes(key)) {
+    const deletedIds = getLocalDeletedIds(key);
+    toStore = val.filter((item: any) => item && item.id && !deletedIds.has(item.id) && !item.deleted_at);
+  }
+
+  // 1. Update in-memory store immediately
+  memoryStore[key] = toStore;
+
+  // 2. Persist to IndexedDB (virtually unlimited capacity, bypasses 5MB browser limit)
+  saveToIndexedDB(key, toStore).catch(() => {});
+
+  // 3. Persist to localStorage safely with quota guard
+  try {
+    localStorage.setItem(STORAGE_PREFIX + key, JSON.stringify(toStore));
+  } catch (err: any) {
+    // If browser localStorage quota (5MB) is exceeded, try storing recent items or let IndexedDB handle it
+    console.warn(`localStorage quota exceeded for key ${key}, relying on IndexedDB:`, err);
+    try {
+      if (Array.isArray(toStore)) {
+        // Store only the most recent 100 items in localStorage as a lightweight emergency fallback
+        localStorage.setItem(STORAGE_PREFIX + key, JSON.stringify(toStore.slice(0, 100)));
+      }
+    } catch {}
+  }
 }
 
 // Recalculate inventory dynamically based on purchases and sales ledger
@@ -272,9 +338,18 @@ export function handleMockApi(path: string, method = "GET", body?: any): any {
     const dueDate = ordBody.due_date || new Date(new Date(orderDateStr).getTime() + credit_days * 86400000).toISOString();
 
     const refPrefix = kind === "sale" ? "INV-" : "PO-";
+    const orderId = (kind === "sale" ? "so_" : "po_") + Date.now();
+    let invoiceFile = ordBody.invoice_file || null;
+    if (invoiceFile && invoiceFile.data_url) {
+      saveInvoiceAttachment(orderId, invoiceFile).catch((e) => console.warn("saveInvoiceAttachment error:", e));
+      invoiceFile = cleanInvoiceMeta(invoiceFile);
+    } else if (invoiceFile) {
+      invoiceFile = cleanInvoiceMeta(invoiceFile);
+    }
+
     const newOrder = {
       ...ordBody,
-      id: (kind === "sale" ? "so_" : "po_") + Date.now(),
+      id: orderId,
       kind,
       party_id: kind === "sale" ? (ordBody.party_id || null) : null,
       party_name: ordBody.party_name || (kind === "sale" ? "Dealer" : "Supplier"),
@@ -286,7 +361,7 @@ export function handleMockApi(path: string, method = "GET", body?: any): any {
       items,
       total,
       payments,
-      invoice_file: ordBody.invoice_file || null,
+      invoice_file: invoiceFile,
       created_at: new Date().toISOString(),
     };
 
@@ -349,6 +424,19 @@ export function handleMockApi(path: string, method = "GET", body?: any): any {
     const effectiveDate = ordBody.date || existing.date || new Date().toISOString();
     const newDueDate = ordBody.due_date || (newCreditDays !== undefined ? new Date(new Date(effectiveDate).getTime() + newCreditDays * 86400000).toISOString() : existing.due_date);
 
+    let finalInvoiceFile = existing.invoice_file || null;
+    if (ordBody.invoice_file !== undefined) {
+      if (ordBody.invoice_file && ordBody.invoice_file.data_url) {
+        saveInvoiceAttachment(oid, ordBody.invoice_file).catch((e) => console.warn("saveInvoiceAttachment error:", e));
+        finalInvoiceFile = cleanInvoiceMeta(ordBody.invoice_file);
+      } else if (ordBody.invoice_file) {
+        finalInvoiceFile = cleanInvoiceMeta(ordBody.invoice_file);
+      } else {
+        deleteInvoiceAttachment(oid).catch(() => {});
+        finalInvoiceFile = null;
+      }
+    }
+
     const updated = {
       ...existing,
       party_id: ordBody.party_id !== undefined ? ordBody.party_id : existing.party_id,
@@ -358,7 +446,7 @@ export function handleMockApi(path: string, method = "GET", body?: any): any {
       credit_days: newCreditDays,
       due_date: newDueDate,
       notes: ordBody.notes !== undefined ? ordBody.notes : existing.notes,
-      invoice_file: ordBody.invoice_file !== undefined ? ordBody.invoice_file : (existing.invoice_file || null),
+      invoice_file: finalInvoiceFile,
       items: newItems,
       total,
       payments,
@@ -562,6 +650,7 @@ export function handleMockApi(path: string, method = "GET", body?: any): any {
     }
     if (method === "DELETE") {
       recordLocalDeletedId("orders", oid);
+      deleteInvoiceAttachment(oid).catch(() => {});
       let orders = getStored<any[]>("orders", SEED_ORDERS);
       orders = orders.filter((item) => item.id !== oid);
       setStored("orders", orders);
@@ -689,13 +778,18 @@ export function handleMockApi(path: string, method = "GET", body?: any): any {
     if (!o) throw new Error("Order not found: " + oid);
 
     if (method === "POST" || method === "PUT" || method === "PATCH") {
-      o.invoice_file = body?.invoice_file !== undefined ? body.invoice_file : body;
+      const rawAttachment = body?.invoice_file !== undefined ? body.invoice_file : body;
+      if (rawAttachment && rawAttachment.data_url) {
+        saveInvoiceAttachment(oid, rawAttachment).catch((e) => console.warn("saveInvoiceAttachment error:", e));
+      }
+      o.invoice_file = cleanInvoiceMeta(rawAttachment);
       o.updated_at = new Date().toISOString();
       setStored("orders", orders);
       syncOrderToFirestore(o);
       return serializeOrder(o);
     }
     if (method === "DELETE") {
+      deleteInvoiceAttachment(oid).catch(() => {});
       o.invoice_file = null;
       o.updated_at = new Date().toISOString();
       setStored("orders", orders);
